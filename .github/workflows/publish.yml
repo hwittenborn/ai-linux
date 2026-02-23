@@ -210,11 +210,11 @@ jobs:
           fi
           sudo apt-get update
           sudo apt-get install -y createrepo-c gnupg rpm
-          cat <<EOF > ~/.rpmmacros
-%_signature gpg
-%_gpg_name ${{ secrets.GPG_KEY_ID }}
-%_gpg_path $HOME/.gnupg
-EOF
+          printf '%s\n' \
+            '%_signature gpg' \
+            '%_gpg_name ${{ secrets.GPG_KEY_ID }}' \
+            "%_gpg_path $HOME/.gnupg" \
+            > ~/.rpmmacros
           for pkg in rpm/x86_64/*.rpm; do
             rpmsign --addsign "$pkg"
           done
