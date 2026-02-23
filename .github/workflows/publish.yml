@@ -1,0 +1,169 @@
+name: Publish Koca Packages
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'koca/**.koca'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      names: ${{ steps.find-files.outputs.names }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - id: find-files
+        run: |
+          names=$(find koca -name '*.koca' -exec basename {} .koca \; | jq -R . | jq -s -c .)
+          echo "names=$names" >> $GITHUB_OUTPUT
+
+  build:
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        koca-name: ${{ fromJSON(needs.discover.outputs.names) }}
+      fail-fast: false
+    container:
+      image: ghcr.io/koca-build/koca
+      options: --user root
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: apt-get update && apt-get install -y curl
+
+      - name: Build with Koca
+        run: koca create "koca/${{ matrix.koca-name }}.koca" --output-type deb
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.koca-name }}
+          path: "*.deb"
+
+  release:
+    needs: [discover, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        koca-name: ${{ fromJSON(needs.discover.outputs.names) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: package-${{ matrix.koca-name }}
+
+      - name: Parse package info
+        id: package-info
+        run: |
+          pkgname=$(grep -E '^pkgname=' "koca/${{ matrix.koca-name }}.koca" | cut -d'=' -f2)
+          pkgver=$(grep -E '^pkgver=' "koca/${{ matrix.koca-name }}.koca" | cut -d'=' -f2)
+          echo "pkgname=$pkgname" >> $GITHUB_OUTPUT
+          echo "pkgver=$pkgver" >> $GITHUB_OUTPUT
+          echo "tag=${pkgname}-${pkgver}" >> $GITHUB_OUTPUT
+
+      - name: Check for existing release
+        id: check-release
+        run: |
+          if gh release view "${{ steps.package-info.outputs.tag }}" --repo "${{ github.repository }}"; then
+            echo "Release already exists."
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Release does not exist. Proceeding with release creation."
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create GitHub Release
+        if: steps.check-release.outputs.exists == 'false'
+        run: |
+          gh release create "${{ steps.package-info.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ steps.package-info.outputs.pkgname }}@${{ steps.package-info.outputs.pkgver }}" \
+            --notes "Release for \`${{ steps.package-info.outputs.pkgname }}@${{ steps.package-info.outputs.pkgver }}\`" \
+            *.deb
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-repo:
+    needs: [discover, release]
+    runs-on: ubuntu-latest
+    if: success()
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Create Debian repository structure
+        run: mkdir -p debian-repo/pool/main
+
+      - name: Download all latest .deb packages
+        run: |
+          for koca_file in koca/*.koca; do
+            pkgname=$(grep -E '^pkgname=' "$koca_file" | cut -d'=' -f2)
+            # Find the latest release for this package
+            latest_tag=$(gh release list --repo "${{ github.repository }}" --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq ".[] | .tagName" | grep "^${pkgname}-" || true)
+            if [ -n "$latest_tag" ]; then
+              gh release download "$latest_tag" --repo "${{ github.repository }}" --pattern "*.deb" --dir "debian-repo/pool/main"
+            fi
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Debian repository metadata
+        run: |
+          if [ -z "$(ls -A debian-repo/pool/main 2>/dev/null)" ]; then
+            echo "No packages found to publish."
+            exit 0
+          fi
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev
+          cd debian-repo
+          mkdir -p dists/stable/main/binary-amd64
+          dpkg-scanpackages pool/main /dev/null > dists/stable/main/binary-amd64/Packages
+          gzip -9c dists/stable/main/binary-amd64/Packages > dists/stable/main/binary-amd64/Packages.gz
+          
+          cat <<EOF > dists/stable/main/Release
+          Origin: ${{ github.repository_owner }}
+          Label: ${{ github.repository_owner }}
+          Suite: stable
+          Codename: stable
+          Version: 1.0
+          Architectures: amd64
+          Components: main
+          Description: ${{ github.repository_owner }}'s Debian repository
+          Date: $(date -uR)
+          MD5Sum:
+           $(md5sum dists/stable/main/binary-amd64/Packages | awk '{print $1}') $(wc -c < dists/stable/main/binary-amd64/Packages) main/binary-amd64/Packages
+           $(md5sum dists/stable/main/binary-amd64/Packages.gz | awk '{print $1}') $(wc -c < dists/stable/main/binary-amd64/Packages.gz) main/binary-amd64/Packages.gz
+          SHA256:
+           $(sha256sum dists/stable/main/binary-amd64/Packages | awk '{print $1}') $(wc -c < dists/stable/main/binary-amd64/Packages) main/binary-amd64/Packages
+           $(sha256sum dists/stable/main/binary-amd64/Packages.gz | awk '{print $1}') $(wc -c < dists/stable/main/binary-amd64/Packages.gz) main/binary-amd64/Packages.gz
+          EOF
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./debian-repo
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
