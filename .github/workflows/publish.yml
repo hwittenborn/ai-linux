@@ -218,6 +218,8 @@ jobs:
           for pkg in rpm/x86_64/*.rpm; do
             rpmsign --addsign "$pkg"
           done
+          gpg --export --armor "${{ secrets.GPG_KEY_ID }}" > /tmp/repo-signing.key
+          sudo rpm --import /tmp/repo-signing.key
           rpm -Kv rpm/x86_64/*.rpm
           createrepo_c rpm
           gpg --batch --yes --pinentry-mode loopback --detach-sign --armor -u "${{ secrets.GPG_KEY_ID }}" rpm/repodata/repomd.xml
